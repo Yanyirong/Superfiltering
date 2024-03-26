@@ -1,228 +1,273 @@
-import os
-import json
 import torch
+import json
 import argparse
 import jsonlines
+import os
+from math import ceil
 from tqdm import tqdm
 import torch
 import torch.distributed as dist
-from itertools import chain
 from math import ceil
-
+import typing as tp
+from pathlib import Path
+from mmengine.dist import get_rank, get_world_size, init_dist
+from mmengine import MMLogger
 from transformers import AutoTokenizer, AutoModelForCausalLM
+from filelock import FileLock, SoftFileLock
+from collections import defaultdict
+import pandas as pd
 
 
-PROMPT_DICT_NONE = {
-    "prompt_input": (
-        "{instruction}\n{input}\n"
-    ),
-    "prompt_no_input": (
-        "{instruction}\n"
-    ),
-}
+logger = None
+im_start = '[UNUSED_TOKEN_146]'
+im_end = '[UNUSED_TOKEN_145]'
 
-def build_inputs(tokenizer, query: str, assistant, meta_instruction="", ):
-        if tokenizer.add_bos_token:
-            prompt = ""
-        else:
-            prompt = tokenizer.bos_token
-        if meta_instruction:
-            prompt += f"""<|im_start|>system\n{meta_instruction}<|im_end|>\n"""
-        prompt += f"""<|im_start|>user\n{query}<|im_end|>\n<|im_start|>assistant\n"""
-        whole_prompt = prompt + f"{assistant}<|im_end|\n>"
-        return tokenizer([prompt], return_tensors="pt"), tokenizer([whole_prompt], return_tensors="pt")
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data_path", type=str, default='data/alpaca_data/alpaca_data.json')
-    parser.add_argument("--save_path", type=str, default='debug.jsonl')
-    parser.add_argument("--model_name_or_path", type=str, default='gpt2')
-    parser.add_argument("--max_length", type=int, default=1024)
-    parser.add_argument("--start_idx", type=int, default=0)
-    parser.add_argument("--end_idx", type=int, default=-1)
-    parser.add_argument("--prompt", type=str, default='none', help='none')
+    parser.add_argument("model_path", type=str)
+    parser.add_argument("data_root", type=str)
+    parser.add_argument("save_root", type=str)
+    parser.add_argument("--num", type=int, default=-1)
+    parser.add_argument("--max_seq_len", type=int, default=8192)
+    parser.add_argument("--max_rounds", type=int, default=4)
+    parser.add_argument("--launcher", type=str, default='none')
+    parser.add_argument("--log_file", type=str, default='./ifds.log')
+    parser.add_argument("--lock_file", type=str, default='ifd_lock.lock')
     args = parser.parse_args()
     return args
 
-# Used to get the ppl and emb for the whole input
-def get_perplexity_and_embedding_whole_text(model, whole_input_ids):
 
-    try:
-        with torch.no_grad(): 
-            outputs = model(whole_input_ids, labels=whole_input_ids.contiguous())
-        loss = outputs.loss
-        perplexity = torch.exp(loss)
+def build_system_instruction(meta_instruction: str):
+    return f"""{im_start}system\n{meta_instruction}{im_end}\n"""
 
-        return perplexity.to('cpu').item(), loss.to('cpu').item()
 
-    # except:
-    except Exception as e:
-        raise e
-        return 0, 0
+def build_user_instruction(instruction: str):
+    return f"""{im_start}user\n{instruction}{im_end}\n{im_start}assistant\n"""
 
-# Used to get the ppl and emb for part of input, used in conditional version, and token-wise loss
-def get_perplexity_and_embedding_part_text(model, input_ids):
 
-    try:
-        
-        labels = input_ids.clone()
+def build_assistant_instruction(answer: str):
+    return f"""{answer}{im_end}\n"""
 
-        with torch.no_grad():
-            outputs = model(input_ids, labels=labels)
 
-        loss = outputs.loss
-        perplexity = torch.exp(loss)
+class DataInfo(tp.TypedDict):
+    source_path: Path
+    saved_path: Path
+    content: list
+    ifd_score: float
+    idx: int
 
-        return perplexity.to('cpu').item(), loss.to('cpu').item()
+
+class IFDInputs(tp.NamedTuple):
+    inputs: tp.Tuple[tp.List[int], tp.List[int]]  # data, label
+    whole_inputs: tp.Tuple[tp.List[int], tp.List[int]]  # data, label
+
+
+def is_multi_turn(data: list):
+    return len(data) > 3
+
+
+def tokenize_inputs(instruction, answer, tokenizer, max_seq_len=8192):
+    instruction_token = tokenizer.encode(instruction, return_tensors="pt").cuda()
+    answer_token = tokenizer.encode(answer, return_tensors="pt").cuda()
+
+    answer_token = answer_token[:, :max_seq_len]
+    whole_input_ids = torch.cat([instruction_token, answer_token], dim=1)
+    whole_input_labels = torch.cat([torch.full_like(instruction_token, -100), answer_token], dim=1)
+
+    strip_length = whole_input_ids.shape[1] - max_seq_len
+    if strip_length > 0:
+        whole_input_ids = whole_input_ids[strip_length:]
+        whole_input_labels = whole_input_labels[strip_length:]
     
-    except Exception as e:
-        raise e
-        return 0, 0
+    whole_inputs = (whole_input_ids, whole_input_labels)
+    inputs = (answer_token, answer_token)
+    return IFDInputs(inputs=inputs, whole_inputs=whole_inputs)
+
+
+
+def build_inputs(data_info: DataInfo, tokenizer, max_seq_len=8192, max_rounds=8) -> tp.List[IFDInputs]:
+    rounds = data_info['content']
+    model_inputs = []
+    for idx, single_round in enumerate(rounds):
+        if single_round['role'] != 'assistant':
+            continue
+        content_str_list = []
+        for pre_round in rounds[:idx]:
+            if pre_round['role'] == 'assistant':
+                content_str_list.append(build_assistant_instruction(pre_round['content']))
+            elif pre_round['role'] == 'user':
+                content_str_list.append(build_user_instruction(pre_round['content']))
+            elif pre_round['role'] == 'system':
+                content_str_list.append(build_system_instruction(pre_round['content']))
+            else:
+                return None
+        content_str_list.append(build_assistant_instruction(single_round['content']))
+        instruction = ''.join(content_str_list[:-1])
+        answer = ''.join(content_str_list[-1])
+        ifd_input_list = tokenize_inputs(instruction, answer, tokenizer, max_seq_len)
+        if ifd_input_list:
+            model_inputs.append(ifd_input_list)
+        if len(model_inputs) == max_rounds:
+            break
+    return model_inputs
+
+
+def get_raw_data_info(dataset_root: Path, dataset_saved_root: Path, num: int = -1) -> tp.List[DataInfo]:
+    world_size = get_world_size()
+    rank = get_rank()
+
+    data_infos = []
+    origin_path = dataset_root / 'processed'
+    for source_path in origin_path.rglob("**/*.jsonl"):
+        saved_path = dataset_saved_root / source_path.relative_to(dataset_root)
+        with jsonlines.open(source_path) as f:
+            for idx, data in enumerate(f):
+                if num != -1 and idx >= num:
+                    break
+                data_infos.append(DataInfo(source_path=source_path, saved_path=saved_path, content=data, ifd_score=None, idx=idx))
+    data_infos = data_infos[rank::world_size]
+    return data_infos
+
+
+def inference(ifd_inputs: tp.List[IFDInputs], model):
+    ifd_scores = []
+    for ifd_input in ifd_inputs:
+        inputs, inputs_label = ifd_input.inputs
+        whole_inputs, whole_input_label = ifd_input.whole_inputs
+        with torch.inference_mode():
+            inputs_loss = model(inputs, labels=inputs_label).loss
+            whole_inputs_loss = model(whole_inputs, labels=whole_input_label).loss
+        inputs_perplexity = torch.exp(inputs_loss).cpu().item()
+        whole_inputs_perplexity = torch.exp(whole_inputs_loss).cpu().item()
+        ifd_scores.append(whole_inputs_perplexity / inputs_perplexity)
+
+    return sum(ifd_scores) / len(ifd_scores)
+
+
+def save_result(cache_file):
+    file_handlers = {}
+    f = open(cache_file)
+    for data in f:
+        data = json.loads(data)
+        saved_path = data['saved_path']
+        Path(saved_path).parent.mkdir(exist_ok=True, parents=True)
+        if saved_path not in file_handlers:
+            file_handlers[saved_path] = jsonlines.open(saved_path, 'w')
+        content = data['content']
+        content[0]['IFD_score'] = data['ifd_score']
+        file_handlers[saved_path].write(content)
+    f.close()
+    for f in file_handlers.values():
+        f.close()
+
+
+def save_result_to_excel(cache_file):
+    def contnt_to_str(content):
+        content_str = ''
+        for single_round in content:
+            content_str += f"{single_round['role']}\n"
+            content_str += f"{single_round['content']}\n\n"
+        return content_str
+
+    df_data_dict = defaultdict(dict)
+    f = open(cache_file)
+    for data in f:
+        data = json.loads(data)
+        saved_path = data['saved_path']
+        if 'content' not in df_data_dict[saved_path]:
+            df_data_dict[saved_path]['content'] = []
+            df_data_dict[saved_path]['ifd_score'] = []
+
+        content = data['content']
+        content_str = contnt_to_str(content)
+        ifd_score = data['ifd_score']
+
+
+        df_data_dict[saved_path]['content'].append(content_str)
+        df_data_dict[saved_path]['ifd_score'].append(ifd_score)
+
+    for saved_path, df_data in df_data_dict.items():
+        saved_path = Path(saved_path)
+        saved_path.parent.mkdir(exist_ok=True, parents=True)
+        df = pd.DataFrame(df_data)
+        df.to_excel(saved_path.with_suffix('.xlsx'), index=False)
+
+    
+
+
+def parse_cache_file(cache_file: Path):
+    data_infos = []
+    # jsonline could failed to parse the cache file, do not why
+    with open(cache_file) as f:
+        for line in f.readlines():
+            data_infos.append(json.loads(line))
+    cache_mapping = defaultdict(set)
+    for data_info in data_infos:
+        cache_mapping[data_info['source_path']].add(data_info['idx'])
+    return cache_mapping
+
+
+def is_processed(data_info: DataInfo, cache_mapping):
+    source_path_str = str(data_info['source_path'])
+    return source_path_str in cache_mapping and data_info['idx'] in cache_mapping[source_path_str]
 
 
 def main():
-
+    global logger
     args = parse_args()
-    
-    # model = AutoModelForCausalLM.from_pretrained(args.model_name_or_path, device_map="auto", cache_dir='../cache', output_hidden_states=True)
-    # tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, cache_dir='../cache')
-
-    # model.eval()
-    # init_dist(launcher='slurm', backend='nccl')
-    
-    # torch.cuda.set_device(global_rank)
-    print(args)
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    # global_rank = int(os.environ.get("RANK"), 0)
-    world_size = int(os.environ.get("WORLD_SIZE", 1))
-    # print(local_rank)
+    local_rank = 0
+    init_dist(launcher=args.launcher)
+    local_rank = int(os.getenv('LOCAL_RANK'))
     torch.cuda.set_device(local_rank)
-    if world_size > 1:
-        dist.init_process_group(backend='nccl')
-    if torch.cuda.is_available():
-        device = 'cuda'
+
+    logger = MMLogger('IFDs', log_file=args.log_file)
+
+    lock = SoftFileLock('~/.cache/' + args.lock_file)
+    data_root = Path(args.data_root)
+    save_root = Path(args.save_root)
+    save_root.mkdir(exist_ok=True, parents=True)
+
+    cache_file = save_root / '.cachefile'
+
+    f = jsonlines.open(cache_file, mode='a', flush=True)
+
+    if cache_file.exists():
+        cache_mapping = parse_cache_file(cache_file)
     else:
-        device = "cpu"
-    
-    model = AutoModelForCausalLM.from_pretrained(args.model_name_or_path, cache_dir='../cache', output_hidden_states=True, trust_remote_code=True).to(device)
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, cache_dir='../cache', trust_remote_code=True)
+        cache_mapping = defaultdict(set)
 
-    data = []
-    with open(args.data_path, "r") as f:
-        lines = f.readlines()
-        for line in lines:
-            data.append(json.loads(line))
-    
-    # data: list of dict
-    # with open(args.data_path, "r") as f:
-    #     data = json.load(f)
+    dataset_paths = list(data_root.iterdir())
+    # hardcode to place the Belle at the end
+    for path in dataset_paths.copy():
+        if 'Belle' == path.name:
+            dataset_paths.remove(path)
+            dataset_paths.append(path)
 
-    start_idx = args.start_idx
-    end_idx = args.end_idx if args.end_idx != -1 else len(data)
-    sampled_data = data[start_idx:end_idx]
+    print("=======!!!!!!!LOADING MODEL!!!!!!!=======")
+    tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(args.model_path, trust_remote_code=True).cuda()
+    for dataset_path in dataset_paths:
+        dataset_saved_root = save_root / dataset_path.name
+        data_infos = get_raw_data_info(dataset_path, dataset_saved_root, args.num)
+        if local_rank == 0:
+            data_infos = tqdm(data_infos, desc=f'Scoring {dataset_path.name} IFDs...')
+        for data_info in data_infos:
+            if is_processed(data_info, cache_mapping):
+                continue
+            ifd_inputs = build_inputs(data_info, tokenizer, args.max_seq_len, args.max_rounds)
+            if not ifd_inputs:
+                logger.warning(f"Failed to build inputs for {data_info['source_path']} {data_info['idx']}")
+                data_info['ifd_score'] = None
+            else:
+                ifd_score = inference(ifd_inputs, model)
+                data_info['ifd_score'] = ifd_score
 
-    if not os.path.exists(args.save_path):
-        with open(args.save_path, "w") as file:
-            pass  # Creates an empty file
+            data_info = {k: str(v) if isinstance(v, Path) else v for k, v in data_info.items()}
+            with lock:
+                f.write(data_info)
+    f.close()
 
-    with open(args.save_path, "r") as file:
-        exsisting_num =  sum(1 for _ in file)
-    sampled_data = sampled_data[exsisting_num:]
-
-    all_data = sampled_data
-    ori_length = len(all_data)
-    pad_num = ceil(len(all_data) / world_size) * world_size - len(all_data)
-    for i in range(pad_num):
-        all_data.append(all_data[i])
-    print(f'========================={len(all_data)}============================')
-
-    datas = all_data[local_rank::world_size]
-    print(f">>> running {len(datas)} docs")
-
-
-    if args.prompt == 'none':
-        prompt_no_input = PROMPT_DICT_NONE["prompt_no_input"]
-        prompt_input = PROMPT_DICT_NONE["prompt_input"]
-
-    ifd_scores = []
-    for i in tqdm(range(len(datas))):
-
-        data_i = datas[i]
-        # print(data[i])
-        # instruct_i = data_i['instruction']
-        # output_i = data_i['output']
-        
-        '''
-        for multi-dialogue
-        '''
-        # ifds = []
-        # for i in range(0, len(data_i), 3):
-        #     meta_instruction = data_i[i]['content']
-        #     query = data_i[i+1]['content']
-        #     assistant = data_i[i+2]['content']
-        
-        #     inputs, whole_inputs = build_inputs(tokenizer, query, assistant, meta_instruction)
-        #     inputs = {k: v.cuda() for k, v in inputs.items() if torch.is_tensor(v)}
-        #     whole_inputs = {k: v.cuda() for k, v in whole_inputs.items() if torch.is_tensor(v)}
-        #     # also add end-of-assistant token in eos token id to avoid unnecessary generation
-        #     # eos_token_id = [tokenizer.eos_token_id, tokenizer.convert_tokens_to_ids(["<|im_end|>"])[0]]
-
-        #     ppl_out_alone, loss_out_alone = get_perplexity_and_embedding_whole_text(model, whole_inputs['input_ids'])
-        #     ppl_out_condition, loss_out_condition = get_perplexity_and_embedding_part_text(model, inputs['input_ids'])
-
-        #     temp_data_i = {}
-        #     temp_data_i['ppl'] = [0,ppl_out_alone,0,ppl_out_condition]
-        #     temp_data_i['loss'] = [0,loss_out_alone,0,loss_out_condition]
-        #     ifd = ppl_out_condition/ppl_out_alone
-        #     ifds.append(ifd)
-
-        # ifd_scores.append(sum(ifds)/len(ifds))
-        
-        '''
-        for simple-dialogue without meta
-        '''
-        meta_instruction = None
-        query = data_i[0]['content']
-        assistant = data_i[1]['content']
-        
-        '''
-        for simple_dialogue with meta
-        '''
-        # meta_instruction = data_i[0]['content']
-        # query = data_i[1]['content']
-        # assistant = data_i[2]['content']
-        
-        inputs, whole_inputs = build_inputs(tokenizer, query, assistant, meta_instruction)
-        inputs = {k: v.cuda() for k, v in inputs.items() if torch.is_tensor(v)}
-        whole_inputs = {k: v.cuda() for k, v in whole_inputs.items() if torch.is_tensor(v)}
-        # also add end-of-assistant token in eos token id to avoid unnecessary generation
-        # eos_token_id = [tokenizer.eos_token_id, tokenizer.convert_tokens_to_ids(["<|im_end|>"])[0]]
-
-        ppl_out_alone, loss_out_alone = get_perplexity_and_embedding_whole_text(model, whole_inputs['input_ids'])
-        ppl_out_condition, loss_out_condition = get_perplexity_and_embedding_part_text(model, inputs['input_ids'])
-
-        temp_data_i = {}
-        temp_data_i['ppl'] = [0,ppl_out_alone,0,ppl_out_condition]
-        temp_data_i['loss'] = [0,loss_out_alone,0,loss_out_condition]
-        ifd = ppl_out_condition/ppl_out_alone
-        ifd_scores.append(ifd)
-        # data_i[0]['ifd_score'] = ifd
-        # data_i[0]['ifd_score'] = ifd
-        # with open(args.save_path, "a") as file:
-        #     file.write(json.dumps(temp_data_i) + '\n')
-        # with jsonlines.open(args.save_path, 'a', flush=True) as file:
-        #     file.write(data_i)
-    tmp = [None] * world_size
-    # dist.all_gather_object(tmp, complexity_outputs)
-    dist.all_gather_object(tmp, ifd_scores)
-    outputs = list(chain(*zip(*tmp)))[:ori_length]
-    if local_rank == 0:
-        with jsonlines.open(args.save_path, 'a', flush=True) as file:
-            for data, ifd_score in zip(all_data, outputs):
-                data[0]['ifd_score'] = ifd_score
-                file.write(data)
-    
-    print('Done: Data Analysis:',args.data_path)
 
 if __name__ == "__main__":
     main()
